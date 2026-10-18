@@ -1,181 +1,151 @@
 # IcarisLogistics
 
-B2B-сервис экспедирования грузов **Китай → Россия**: публичный лендинг с калькулятором и
-заявками, менеджерская обработка, Telegram-бот и Mini App для клиента (отслеживание грузов +
-чат). Учебный и коммерческий проект.
+IcarisLogistics is a logistics CRM/MVP for **China → Russia freight forwarding**.
 
-Источник истины по направлению и фазам — [`docs/ROADMAP.md`](./docs/ROADMAP.md). Осознанные
-MVP-упрощения и техдолг — [`docs/tech-debt.md`](./docs/tech-debt.md).
+It combines:
+- a public landing page with lead capture,
+- a manager workflow for shipment operations,
+- a Telegram bot + Telegram Mini App for customer access,
+- and a Go backend with PostgreSQL.
 
-## Что умеет (MVP)
+> This repository is intentionally honest about its state: production is **not currently live** (details in [Deployment status](#deployment-status)).
 
-- **Лендинг** — описание услуги, калькулятор диапазона цены, форма заявки → `Lead` в БД.
-- **Менеджер** — вход по email+паролю (JWT), CRUD лидов и грузов, смена статуса с историей,
-  чат с клиентом, платежи по грузу. Панель — `/manager.html`; уведомление о новом лиде в Telegram.
-- **Клиент** — авторизация через Telegram (бот `/start` или Mini App по `initData`),
-  быстрый `/status` в боте, уведомления о смене статуса и платежах.
-- **WebApp (Telegram Mini App)** — список грузов, детали + таймлайн истории статусов, платежи,
-  чат с менеджером.
+## What the platform does today (MVP)
 
-## Стек
+- **Lead intake:** landing page calculator + lead form (`Lead` persisted in PostgreSQL).
+- **Manager panel:** email/password login, lead/shipment operations, shipment status updates, messaging, and shipment-level payment records.
+- **Telegram bot:** customer onboarding (`/start`), quick status checks (`/status`), and operational notifications.
+- **Telegram Mini App:** shipment list/details, status timeline, chat with manager, and payment history.
+- **Notifications:** Telegram notifications are queued via an **outbox** (`notifications` table + retry dispatcher) for at-least-once delivery.
 
-- **Backend:** Go + Gin + GORM + PostgreSQL. Схема — SQL-миграции (не AutoMigrate).
-- **Frontend:** React + TypeScript + Vite + Tailwind v4. Три точки входа (лендинг + Mini App +
-  панель менеджера), общая дизайн-система. Telegram WebApp SDK.
-- **Bot:** go-telegram-bot-api, long polling или webhook (`TELEGRAM_WEBHOOK_*`); исходящие
-  уведомления через outbox с ретраями.
-- **Локально:** Docker Compose (Postgres).
+## Tech stack
 
-## Архитектура
+- **Backend:** Go 1.26, Gin, GORM, PostgreSQL, SQL migrations (`golang-migrate`), JWT auth.
+- **Frontend:** React 19 + TypeScript + Vite + Tailwind v4.
+- **Telegram:** `go-telegram-bot-api` (long polling or webhook mode), Mini App auth via signed `initData` (HMAC validation).
+- **Local infra:** Docker Compose (Postgres).
 
-Слои бэкенда: `http (Gin)` → `service` (бизнес-логика) → `repository` (GORM) → `db`.
-Интерфейсы объявлены на стороне потребителя; бот и сервисы связаны контрактами, без циклов.
+## Architecture
 
-```
+Layering in backend:
+
+`HTTP (Gin) → service (business logic) → repository (GORM) → PostgreSQL`
+
+```text
 backend/
-  cmd/{api,migrate,createmanager}   # точки входа и CLI
+  cmd/{api,migrate,createmanager}   # entrypoints / CLI
   internal/
-    domain/        # сущности: Manager, Lead, Client, Shipment, Message, ShipmentStatusEvent, Payment, Notification
-    repository/    # GORM-репозитории
-    service/       # бизнес-логика (Lead, Auth, Client, Shipment, Message, Payment)
-    http/          # Gin-роутер и хендлеры
-    middleware/    # JWT-проверка (RequireAuth / RequireClientAuth)
-    token/         # выпуск/разбор JWT с ролью (manager | client)
-    telegram/      # проверка подписи Telegram initData (HMAC)
-    bot/           # Telegram-бот (команды + уведомления)
-  migrations/      # SQL-миграции (схема v13)
+    domain/        # core entities
+    repository/    # data access
+    service/       # business logic
+    http/          # routes + handlers
+    middleware/    # auth/body/rate-limit middleware
+    token/         # JWT issuance/parsing
+    telegram/      # Telegram initData (HMAC) validation
+    bot/           # bot commands + outbox dispatcher
+  migrations/      # SQL migrations
 frontend/
-  index.html  + src/                # лендинг
-  webapp.html + src/webapp/         # Telegram Mini App
-  manager.html + src/manager/       # панель менеджера
-  src/index.css                     # общие дизайн-токены
+  index.html  + src/          # landing page
+  manager.html + src/manager/ # manager panel
+  webapp.html + src/webapp/   # Telegram Mini App
 ```
 
-## Пользовательский поток
+See also: [`docs/architecture.md`](./docs/architecture.md).
 
-1. Посетитель на лендинге считает калькулятор и оставляет заявку (`Lead`) — без регистрации.
-2. Менеджер получает уведомление в Telegram, связывается, согласует цену.
-3. Клиент проходит верификацию в боте (`/start`) — создаётся аккаунт `Client` (по `telegram_id`).
-4. Менеджер заводит груз (`Shipment`) с уникальным `tracking_key` и ведёт статусы.
-5. Клиент следит за грузами в Mini App (детали + история) и общается с менеджером в чате;
-   быстрый `/status` работает прямо в боте.
+## Security and authentication model
 
-## Локальный запуск
+- **Manager auth:** `POST /api/auth/login` returns JWT (`role=manager`).
+- **Client auth:** `POST /api/app/auth/telegram` validates Telegram `initData` signature and returns JWT (`role=client`).
+- **Role-based guards:** manager routes use `RequireAuth`, Mini App routes use `RequireClientAuth`.
+- **Operational safety checks:** request body size limits, route-level rate limiting, CORS allowlist support, trusted proxy handling.
+
+## Core user flow
+
+1. Visitor submits a lead from the landing page.
+2. Manager receives Telegram notification and qualifies the lead.
+3. Customer is onboarded through Telegram (`Client` linked by `telegram_id`).
+4. Manager creates/updates shipment, statuses, messages, and payment records.
+5. Customer tracks shipments and chat in the Mini App, with `/status` in bot as a quick command.
+
+## Local setup
+
+### 1) Start Postgres
 
 ```bash
-docker compose up -d postgres        # Postgres на :5433
+docker compose up -d postgres
+```
 
+### 2) Run backend
+
+```bash
 cd backend
-go run ./cmd/migrate up              # применить миграции (до v13)
-go run ./cmd/createmanager -email=manager@example.com -name="Имя" -password='<свой-пароль>'
-go run ./cmd/api                     # http://localhost:8080 (без TELEGRAM_BOT_TOKEN бот в no-op)
+go run ./cmd/migrate up
+go run ./cmd/createmanager -email=manager@example.com -name="Manager" -password='<your-password>'
+go run ./cmd/api
+```
 
-cd ../frontend
+Backend runs on `http://localhost:8080` by default.
+
+### 3) Run frontend
+
+```bash
+cd frontend
 npm install
-npm run dev                          # :5173 — лендинг, /webapp.html — Mini App, /manager.html — панель; /api → :8080
+npm run dev
 ```
 
-Без `TELEGRAM_BOT_TOKEN` бот и авторизация WebApp по `initData` выключены; для отладки UI
-WebApp без Telegram в DEV принимается `/webapp.html?token=<client-jwt>`.
+Frontend dev server runs on `:5173`:
+- landing page: `/`
+- Telegram Mini App: `/webapp.html`
+- manager panel: `/manager.html`
 
-## Конфигурация (env)
+Without `TELEGRAM_BOT_TOKEN`, bot behavior is disabled and Mini App Telegram-signature auth is unavailable.
+For local UI debugging without Telegram, dev mode accepts `/webapp.html?token=<client-jwt>`.
 
-В development `backend/.env` автозагружается (godotenv); в проде переменные приходят из
-окружения платформы. Шаблон — `backend/.env.example`. Вне development `config.Validate()`
-останавливает старт при dev-дефолтах: пустой/дефолтный `JWT_SECRET` и `DATABASE_URL`,
-`sslmode=disable`, отсутствие токена/чата бота.
+## Configuration
 
-| Переменная | Назначение | Дефолт |
+Backend env template: [`backend/.env.example`](./backend/.env.example)
+
+| Variable | Purpose | Default |
 |---|---|---|
-| `DATABASE_URL` | строка подключения Postgres | dev-Postgres на `:5433` |
-| `HTTP_ADDR` | адрес API (приоритетнее `PORT`) | `:8080` |
-| `PORT` | порт от облачной платформы (Railway/Render) | — |
-| `APP_ENV` | окружение | `development` |
-| `JWT_SECRET` | секрет подписи JWT | dev-дефолт (**в проде обязателен**) |
-| `JWT_TTL` | время жизни токена | `4h` |
-| `TELEGRAM_BOT_TOKEN` | токен бота; пусто → бот выключен | `""` |
-| `MANAGER_CHAT_ID` | чат для уведомлений менеджеру | `""` |
-| `ALLOWED_ORIGINS` | CORS-белый список origin'ов, через запятую | пусто (вне dev кросс-домен запрещён) |
-| `TRUSTED_PROXIES` | IP/CIDR прокси, чьим X-Forwarded-For верим | приватные диапазоны + CGNAT |
-| `TELEGRAM_WEBHOOK_URL` | https-URL ручки webhook; задан → бот без polling | пусто (long polling) |
-| `TELEGRAM_WEBHOOK_SECRET` | секрет webhook (обязателен вместе с URL) | `""` |
+| `DATABASE_URL` | PostgreSQL DSN | local DB on `:5433` |
+| `HTTP_ADDR` | API bind address (overrides `PORT`) | `:8080` |
+| `PORT` | platform-provided port | — |
+| `APP_ENV` | app environment | `development` |
+| `JWT_SECRET` | JWT signing secret | dev default (must be overridden in non-dev) |
+| `JWT_TTL` | JWT lifetime | `4h` |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token | empty (bot disabled) |
+| `MANAGER_CHAT_ID` | manager chat for notifications | empty |
+| `ALLOWED_ORIGINS` | CORS allowlist (comma-separated) | empty |
+| `TRUSTED_PROXIES` | trusted proxy IP/CIDR list | private ranges + CGNAT |
+| `TELEGRAM_WEBHOOK_URL` | webhook endpoint URL | empty (long polling mode) |
+| `TELEGRAM_WEBHOOK_SECRET` | webhook secret | empty |
 
-Фронтенд-переменные запекаются в бандл **на этапе сборки**:
+Frontend build-time env:
 
-| Переменная | Назначение |
+| Variable | Purpose |
 |---|---|
-| `VITE_API_BASE` | базовый URL бэкенда без `/api`; локально не задаётся |
-| `VITE_PRIVACY_POLICY_URL` | публичный URL действующей политики обработки данных |
-| `VITE_PRIVACY_NOTICE_VERSION` | короткая версия политики, сохраняемая вместе с заявкой |
+| `VITE_API_BASE` | backend base URL without `/api` |
+| `VITE_PRIVACY_POLICY_URL` | public privacy policy URL |
+| `VITE_PRIVACY_NOTICE_VERSION` | privacy notice version stored with lead consent |
 
-Если URL или версия политики не заданы, форма заявки намеренно отключена.
+If privacy URL/version is missing, lead form submission is intentionally disabled.
 
-## Деплой
+## API surface (high-level)
 
-Production сейчас не развёрнут. Старые Railway API и база удалены; существующий Vercel-деплой
-может показывать устаревшую сборку и не является рабочим сервисом. Целевая российская
-инфраструктура, staging и порядок выпуска описаны в [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+Public:
+- `GET /api/health`
+- `POST /api/leads`
+- `POST /api/auth/login`
+- `POST /api/app/auth/telegram`
 
-Миграции должны выполняться отдельным контролируемым шагом до запуска новой версии API.
-Mini App должна открывать `/webapp.html` на актуальном frontend-домене. Не запускайте два
-экземпляра API с одним Telegram-токеном в режиме long polling: Telegram вернёт конфликт 409.
+Manager JWT routes:
+- `/api/leads`, `/api/clients`, `/api/shipments`, shipment status/messages/payments endpoints
 
-## API
+Client JWT (Mini App) routes:
+- `/api/app/shipments`, shipment details/messages/payments for own shipments
 
-Публичные:
-
-```http
-GET  /api/health
-POST /api/leads               # форма; обязательна privacy_notice_version
-POST /api/auth/login          # менеджер: { "email", "password" } → { "token" }
-POST /api/app/auth/telegram   # клиент: { "init_data" } (Telegram WebApp) → { "token", "client" }
-```
-
-Менеджерские (`Authorization: Bearer <token>`, role=manager):
-
-```http
-GET   /api/leads
-GET   /api/leads/{id}
-PATCH /api/leads/{id}                 # { "status": "new|contacted|converted|rejected" }
-
-GET   /api/clients                    # зарегистрированные клиенты
-
-POST  /api/shipments                  # { "client_id", "lane", "from_city", "to_city", "weight", "volume", "price", "currency", "status_note" }
-GET   /api/shipments
-GET   /api/shipments/{id}             # → { "shipment", "history": [...] }
-PATCH /api/shipments/{id}/status      # { "status", "comment" } — статус из enum груза
-GET   /api/shipments/{id}/messages
-POST  /api/shipments/{id}/messages    # { "text" } — ответ менеджера
-
-POST  /api/shipments/{id}/payments              # { "amount", "currency"?, "channel", "status"?, "comment"? }
-GET   /api/shipments/{id}/payments
-PATCH /api/shipments/{id}/payments/{paymentID}  # { "status": "pending|confirmed|refunded" }
-```
-
-Клиентские WebApp (`Authorization: Bearer <token>`, role=client):
-
-```http
-GET   /api/app/shipments              # только свои грузы
-GET   /api/app/shipments/{id}         # → { "shipment", "history": [...] }
-GET   /api/app/shipments/{id}/messages
-POST  /api/app/shipments/{id}/messages  # { "text" }
-GET   /api/app/shipments/{id}/payments  # платежи своего груза
-```
-
-Списочные ручки принимают `?limit=&offset=` (дефолт 100, максимум 200), сортировка —
-новые сверху. Тела запросов ограничены 64 КиБ.
-
-Статусы груза: `pending, picked_up, in_transit, customs_clear, in_warehouse,
-out_for_delivery, delivered, cancelled`. Полосы: `cargo, white, buyout` (метка на грузе).
-Каналы платежа: `bank_transfer, card_sbp, cash, crypto`. Чужой груз для клиента → 404
-(существование не раскрываем). Ошибки в едином формате:
-`{"error": {"code": "...", "message": "..."}}`.
-
-Уведомления Telegram идут через outbox (таблица `notifications` + диспетчер с ретраями).
-Бот принимает апдейты long polling'ом либо webhook'ом (`POST /api/telegram/webhook`,
-включается переменными `TELEGRAM_WEBHOOK_*`).
-
-## Тесты
+## Testing and quality checks
 
 ```bash
 docker compose up -d postgres
@@ -183,11 +153,34 @@ cd backend && go run ./cmd/migrate up && go test ./... && go vet ./... && go bui
 cd ../frontend && npm ci && npm run lint && npm run build
 ```
 
-Repository-тесты используют PostgreSQL на `localhost:5433`; без доступной БД они пропускаются.
+The repository test suite expects PostgreSQL. Some DB-backed repository tests are skipped if DB is unavailable.
 
-## Документы
+CI workflow: [GitHub Actions / CI](https://github.com/GomenAmonai/IcarisLogistics/actions/workflows/ci.yml)
 
-- [`docs/ROADMAP.md`](./docs/ROADMAP.md) — направление, порядок работ и условия релиза.
-- [`docs/architecture.md`](./docs/architecture.md) — доменная модель и границы MVP.
-- [`docs/tech-debt.md`](./docs/tech-debt.md) — осознанные MVP-упрощения и техдолг.
-- [`docs/backend-onboarding.md`](./docs/backend-onboarding.md) — вводный обзор backend.
+## Deployment status
+
+Production is **not currently deployed**.
+
+- Previous Railway API/database were removed.
+- Existing Vercel deployment may show an outdated build and is **not** an active production service.
+- Planned Russian-hosted infrastructure and release phases are documented in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+
+Migrations should run as a controlled step before rolling out a new API version.
+Do not run multiple API instances with the same Telegram token in long polling mode (Telegram returns conflict 409).
+
+## Current limitations (intentional MVP scope)
+
+- JWT-only auth flow (no refresh token / revocation yet).
+- Manager creation is CLI-based (`cmd/createmanager`).
+- Chat currently has no realtime transport (no SSE/WebSocket yet).
+- Outbox dispatcher is single-process oriented.
+- Some hardening tasks are tracked as technical debt.
+
+See: [`docs/tech-debt.md`](./docs/tech-debt.md)
+
+## Additional documentation
+
+- [`docs/ROADMAP.md`](./docs/ROADMAP.md) — release roadmap and rollout constraints.
+- [`docs/architecture.md`](./docs/architecture.md) — domain and system architecture notes.
+- [`docs/backend-onboarding.en.md`](./docs/backend-onboarding.en.md) — deep backend walkthrough for engineers.
+- [`docs/backend-onboarding.md`](./docs/backend-onboarding.md) — Russian version of backend onboarding.
